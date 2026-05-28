@@ -1,0 +1,756 @@
+# =============================================================================
+# semgrep.yml — Custom Semgrep rules for NestJS / TypeScript stack
+# Supplements official rulesets with company-specific patterns.
+# =============================================================================
+
+rules:
+
+  # ── NestJS specific ─────────────────────────────────────────────────────────
+
+  - id: nestjs-missing-auth-guard
+    patterns:
+      - pattern: |
+          @Controller(...)
+          class $CLASS { ... }
+      - pattern-not: |
+          @UseGuards(...)
+          @Controller(...)
+          class $CLASS { ... }
+      - pattern-not: |
+          @Controller(...)
+          @UseGuards(...)
+          class $CLASS { ... }
+    message: >
+      Controller '$CLASS' has no @UseGuards decorator.
+      Ensure all endpoints are intentionally public or protected.
+    languages: [typescript]
+    severity: WARNING
+    metadata:
+      owasp: ["A01:2021 - Broken Access Control"]
+      category: security
+
+  - id: nestjs-public-decorator-audit
+    pattern: "@Public()"
+    message: >
+      @Public() decorator found — verify this endpoint intentionally bypasses auth.
+      Ensure it doesn't expose sensitive data.
+    languages: [typescript]
+    severity: INFO
+    metadata:
+      category: security
+
+  - id: typeorm-query-injection
+    patterns:
+      - pattern: $REPO.query($QUERY + $INPUT, ...)
+      - pattern: $REPO.query(`...${$INPUT}...`, ...)
+    message: >
+      Potential SQL injection: raw query with string interpolation.
+      Use parameterized queries: .query('SELECT * FROM t WHERE id = $1', [id])
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-89"]
+      owasp: ["A03:2021 - Injection"]
+
+  - id: hardcoded-jwt-secret
+    patterns:
+      - pattern: |
+          JwtModule.register({ secret: "..." })
+      - pattern: |
+          JwtModule.register({ secret: '...' })
+    message: >
+      Hardcoded JWT secret detected. Use ConfigService:
+      JwtModule.registerAsync({ useFactory: (cfg) => ({ secret: cfg.get('JWT_SECRET') }) })
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-798"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+
+  - id: unsafe-any-cast
+    pattern: $X as any
+    message: >
+      Avoid casting to 'any' — it disables type safety. Use proper types or 'unknown'.
+    languages: [typescript]
+    severity: INFO
+    metadata:
+      category: code-quality
+
+  # ── Express / Fastify ────────────────────────────────────────────────────────
+
+  - id: missing-helmet
+    patterns:
+      - pattern: app.listen(...)
+      - pattern-not: app.use(helmet())
+    message: >
+      Helmet middleware not detected. Add app.use(helmet()) to set security headers.
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      owasp: ["A05:2021 - Security Misconfiguration"]
+
+  # ── Secrets / Credentials ────────────────────────────────────────────────────
+
+  - id: dotenv-in-production-code
+    pattern: require('dotenv').config()
+    message: >
+      dotenv.config() in source code — ensure this is not called in production
+      builds. Use ConfigModule.forRoot() in NestJS instead.
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      category: configuration
+
+  - id: console-log-sensitive
+    patterns:
+      - pattern: console.log($X)
+      - metavariable-regex:
+          metavariable: $X
+          regex: '.*(password|secret|token|key|auth|credential).*'
+    message: >
+      Potential logging of sensitive data. Remove before production deploy.
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-532"]
+      owasp: ["A09:2021 - Security Logging and Monitoring Failures"]
+
+  # ── Redis / Cache ────────────────────────────────────────────────────────────
+
+  - id: redis-no-ttl
+    pattern: $CLIENT.set($KEY, $VALUE)
+    message: >
+      Redis SET without TTL. Missing TTL can cause memory bloat and stale data.
+      Use: client.set(key, value, { EX: ttlSeconds })
+    languages: [typescript, javascript]
+    severity: INFO
+    metadata:
+      category: reliability
+
+  # ── Path traversal ───────────────────────────────────────────────────────────
+
+  - id: path-join-user-input
+    patterns:
+      - pattern: path.join($BASE, $INPUT)
+      - pattern-not: path.join(__dirname, ...)
+      - pattern-not: path.join(process.cwd(), ...)
+    message: >
+      path.join with non-literal input may enable path traversal.
+      Validate and sanitize $INPUT before joining with filesystem paths.
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-22"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  # ── Crypto ───────────────────────────────────────────────────────────────────
+
+  - id: md5-usage
+    pattern: crypto.createHash('md5')
+    message: >
+      MD5 is cryptographically broken. Use SHA-256 or stronger.
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-327"]
+
+  - id: weak-random
+    pattern: Math.random()
+    message: >
+      Math.random() is not cryptographically secure.
+      For security-sensitive use cases (tokens, IDs), use crypto.randomBytes() or crypto.randomUUID().
+    languages: [typescript, javascript]
+    severity: INFO
+    metadata:
+      cwe: ["CWE-338"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: IDOR (#4)
+  # Detect controller methods that accept id params but lack ownership checks.
+  # NOTE: Static analysis can only flag suspicious patterns — confirm manually.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: idor-param-no-ownership-check
+    patterns:
+      - pattern: |
+          @Get(':id')
+          async $METHOD(@Param('id') $ID: $TYPE, ...) {
+            ...
+            $REPO.$FIND(...$ID...)
+            ...
+          }
+      - pattern-not: |
+          @Get(':id')
+          async $METHOD(@Param('id') $ID: $TYPE, ...) {
+            ...
+            $REPO.$FIND(...$ID...)
+            ...
+            if (...$USER...) { ... }
+            ...
+          }
+    message: >
+      Possible IDOR: '$METHOD' fetches by id without visible ownership check.
+      Ensure the result is verified against the authenticated user before returning.
+      Example: if (record.userId !== req.user.id) throw new ForbiddenException()
+    languages: [typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-639"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  - id: idor-put-patch-no-ownership
+    patterns:
+      - pattern: |
+          @$METHOD(':id')
+          async $FN(@Param('id') $ID: $TYPE, ...) {
+            ...
+            $REPO.$UPDATE(...$ID...)
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: '^(Put|Patch|Delete)$'
+      - pattern-not-inside: |
+          if (...$USER...) { ... }
+    message: >
+      Possible IDOR on mutating endpoint '$FN': modifies resource by id without
+      visible ownership check. Always verify resource belongs to requesting user
+      before allowing update/delete.
+    languages: [typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-639"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: Mass Assignment (#7)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: mass-assignment-plain-body
+    patterns:
+      - pattern: |
+          async $METHOD(@Body() $BODY: object, ...) { ... }
+      - pattern: |
+          async $METHOD(@Body() $BODY: any, ...) { ... }
+      - pattern: |
+          async $METHOD(@Body() $BODY: Record<string, any>, ...) { ... }
+    message: >
+      Mass assignment risk: @Body() typed as 'object', 'any', or 'Record<string,any>'.
+      Use a typed DTO with class-validator decorators (@IsString, @IsEmail...) and
+      enable ValidationPipe globally. Never pass raw body to ORM save/update.
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-915"]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+
+  - id: mass-assignment-orm-spread
+    patterns:
+      - pattern: $REPO.save({...$BODY})
+      - pattern: $REPO.update($ID, {...$BODY})
+      - pattern: $REPO.create({...$BODY})
+    message: >
+      Mass assignment risk: spreading request body directly into ORM call.
+      Explicitly pick allowed fields: repo.save({ name: dto.name, price: dto.price })
+      Never: repo.save({ ...body }) — caller controls all fields including isAdmin, role.
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-915"]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: Insecure Deserialization (#8)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: unsafe-yaml-load
+    patterns:
+      - pattern: yaml.load($INPUT)
+      - pattern: yaml.load($INPUT, ...)
+      - pattern-not: yaml.load($INPUT, { schema: yaml.JSON_SCHEMA })
+      - pattern-not: yaml.load($INPUT, { schema: yaml.FAILSAFE_SCHEMA })
+    message: >
+      Insecure YAML deserialization: yaml.load() can execute arbitrary JS via
+      custom types. Use yaml.safeLoad() or yaml.load(input, { schema: yaml.JSON_SCHEMA }).
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-502"]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+
+  - id: json-parse-unvalidated
+    patterns:
+      - pattern: JSON.parse($REQ.body)
+      - pattern: JSON.parse($REQ.query.$X)
+      - pattern: JSON.parse($REQ.params.$X)
+    message: >
+      Parsing request data with JSON.parse() without validation.
+      Use class-transformer + class-validator on DTOs instead of manual JSON.parse.
+      If JSON.parse is necessary, validate the result against a schema immediately.
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-502"]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+
+  - id: eval-user-input
+    patterns:
+      - pattern: eval($INPUT)
+      - pattern: new Function($INPUT)
+      - pattern: new Function(..., $INPUT)
+    message: >
+      eval() / new Function() with dynamic input enables Remote Code Execution.
+      There is almost no legitimate use case for eval in production NestJS code.
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-95"]
+      owasp: ["A03:2021 - Injection"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: SSRF (#9)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: ssrf-fetch-user-url
+    patterns:
+      - pattern: fetch($URL, ...)
+      - pattern-not: fetch("...", ...)
+      - pattern-not: fetch('...', ...)
+      - pattern-not-inside: |
+          const $URL = "..."
+          ...
+    message: >
+      Potential SSRF: fetch() called with a non-literal URL.
+      If $URL originates from user input, attacker can redirect server to internal
+      endpoints (metadata service, Redis, internal APIs).
+      Validate URL against an allowlist before fetching.
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-918"]
+      owasp: ["A10:2021 - Server-Side Request Forgery"]
+
+  - id: ssrf-axios-user-url
+    patterns:
+      - pattern: axios.get($URL, ...)
+      - pattern: axios.post($URL, ...)
+      - pattern: axios($URL, ...)
+      - pattern: axios({ url: $URL, ... })
+      - pattern-not: axios.get("...", ...)
+      - pattern-not: axios.get('...', ...)
+    message: >
+      Potential SSRF: axios called with a non-literal URL.
+      Validate $URL against an allowlist. Block private IP ranges (10.x, 172.16-31.x,
+      192.168.x, 169.254.x for AWS metadata). Use a URL validation library.
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-918"]
+      owasp: ["A10:2021 - Server-Side Request Forgery"]
+
+  - id: ssrf-http-module-dynamic
+    patterns:
+      - pattern: this.$HTTP.get($URL)
+      - pattern: this.$HTTP.post($URL, ...)
+      - pattern-not: this.$HTTP.get("...")
+      - pattern-not: this.$HTTP.get('...')
+    message: >
+      Potential SSRF via NestJS HttpModule: dynamic URL in HTTP call.
+      If $URL is user-controlled, validate against allowlist before making request.
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-918"]
+      owasp: ["A10:2021 - Server-Side Request Forgery"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: Path Traversal — extended (#10)
+  # (base rule already exists above, these cover more patterns)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: path-traversal-readfile
+    patterns:
+      - pattern: fs.readFile($PATH, ...)
+      - pattern: fs.readFileSync($PATH, ...)
+      - pattern-not: fs.readFile(__dirname + "...", ...)
+      - pattern-not-inside: |
+          const $PATH = path.join(__dirname, ...)
+          ...
+    message: >
+      Path traversal risk: fs.readFile with dynamic path.
+      If $PATH contains user input, attacker can read arbitrary files (../../etc/passwd).
+      Use path.resolve() + verify result starts with your allowed base directory.
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-22"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  - id: path-traversal-res-sendfile
+    patterns:
+      - pattern: $RES.sendFile($PATH)
+      - pattern: $RES.download($PATH)
+      - pattern-not: $RES.sendFile(path.join(__dirname, ...))
+    message: >
+      Path traversal risk: res.sendFile/download with dynamic path.
+      Validate $PATH against a whitelist of allowed directories.
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-22"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: CSRF (#11)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: csrf-no-protection-cookie-session
+    patterns:
+      - pattern: app.use(session(...))
+      - pattern-not: app.use(csrf(...))
+      - pattern-not: app.use(csurf(...))
+    message: >
+      Session middleware detected without CSRF protection.
+      Add csurf middleware or implement SameSite=Strict cookie + custom header check.
+      NestJS: use @nestjs/csrf or implement CSRF guard.
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-352"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  - id: cookie-missing-samesite
+    patterns:
+      - pattern: res.cookie($NAME, $VALUE, { ... })
+      - pattern-not: res.cookie($NAME, $VALUE, { ..., sameSite: ..., ... })
+    message: >
+      Cookie set without SameSite attribute — CSRF risk.
+      Add sameSite: 'strict' or 'lax' to prevent cross-site request forgery.
+      Example: res.cookie('token', value, { httpOnly: true, sameSite: 'strict', secure: true })
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-352"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  - id: cookie-missing-httponly
+    patterns:
+      - pattern: res.cookie($NAME, $VALUE, { ... })
+      - pattern-not: res.cookie($NAME, $VALUE, { ..., httpOnly: true, ... })
+    message: >
+      Cookie set without httpOnly: true — XSS can steal this cookie.
+      Always set httpOnly: true for session/auth cookies.
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-1004"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: Broken Access Control (#12) — WARNING only, not ERROR
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: broken-access-no-roles-guard
+    patterns:
+      - pattern: |
+          @Post(...)
+          async $METHOD(...) { ... }
+      - pattern-not-inside: |
+          @Roles(...)
+          ...
+      - pattern-not-inside: |
+          @UseGuards(...)
+          ...
+      - pattern-not-inside: |
+          @Public()
+          ...
+    message: >
+      Broken access control (WARNING): POST handler '$METHOD' has no @Roles or
+      @UseGuards decorator visible at method level.
+      Verify access control is enforced at controller level or via global guard.
+    languages: [typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-285"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  - id: broken-access-admin-route-unguarded
+    patterns:
+      - pattern: |
+          @Controller('admin')
+          class $CLASS { ... }
+      - pattern-not: |
+          @UseGuards(...)
+          @Controller('admin')
+          class $CLASS { ... }
+      - pattern-not: |
+          @Controller('admin')
+          @UseGuards(...)
+          class $CLASS { ... }
+    message: >
+      Broken access control (WARNING): Controller at 'admin' path has no
+      @UseGuards at class level. Admin routes must always be protected.
+    languages: [typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-285"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  - id: broken-access-frontend-only-check
+    patterns:
+      - pattern: |
+          if ($REQ.headers['x-frontend-check']) { ... }
+      - pattern: |
+          if ($REQ.headers['x-internal']) { ... }
+    message: >
+      Broken access control (WARNING): Authorization based on custom header
+      that can be trivially set by any HTTP client.
+      Never rely on frontend-only signals for access control decisions.
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-285"]
+      owasp: ["A01:2021 - Broken Access Control"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: Verbose Error Messages (#17)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: verbose-error-stack-in-response
+    patterns:
+      - pattern: $RES.json({ ..., stack: $ERR.stack, ... })
+      - pattern: $RES.json({ ..., error: $ERR, ... })
+      - pattern: $RES.send($ERR.stack)
+      - pattern: $RES.json($ERR)
+    message: >
+      Verbose error: sending error object or stack trace in HTTP response.
+      Expose only a generic message to clients; log full error server-side.
+      Example: res.status(500).json({ message: 'Internal server error' })
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-209"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+
+  - id: verbose-error-nestjs-exception-filter
+    patterns:
+      - pattern: |
+          throw new $EXCEPTION($ERR.message)
+      - metavariable-regex:
+          metavariable: $EXCEPTION
+          regex: '.*(Exception|Error)$'
+      - pattern-not: |
+          throw new $EXCEPTION('...')
+    message: >
+      Forwarding raw error message to HTTP exception — may leak internal details.
+      Use a fixed user-facing message: throw new BadRequestException('Invalid input')
+      Log the original $ERR separately.
+    languages: [typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-209"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+
+  - id: verbose-console-error-object
+    patterns:
+      - pattern: console.error($ERR)
+      - pattern: console.error('...', $ERR)
+    message: >
+      Logging full error object — ensure this goes to server logs only,
+      never returned in HTTP response. Consider a structured logger (pino, winston)
+      with log level control.
+    languages: [typescript, javascript]
+    severity: INFO
+    metadata:
+      cwe: ["CWE-532"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: CORS Misconfiguration (#15)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: cors-wildcard-origin
+    patterns:
+      - pattern: app.enableCors({ origin: '*', ... })
+      - pattern: app.enableCors({ origin: true, ... })
+      - pattern: app.use(cors({ origin: '*' }))
+      - pattern: app.use(cors())
+      - pattern: res.setHeader('Access-Control-Allow-Origin', '*')
+    message: >
+      CORS wildcard origin: any website can make credentialed requests to your API.
+      Specify allowed origins explicitly:
+      app.enableCors({ origin: ['https://yourapp.com'], credentials: true })
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-942"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+
+  - id: cors-reflect-origin
+    patterns:
+      - pattern: |
+          res.setHeader('Access-Control-Allow-Origin', $REQ.headers.origin)
+      - pattern: |
+          res.setHeader('Access-Control-Allow-Origin', $REQ.headers['origin'])
+    message: >
+      CORS origin reflection: blindly echoing request Origin header.
+      This is equivalent to wildcard CORS and allows any site to make requests.
+      Use an explicit allowlist instead.
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-942"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: Unrestricted File Upload (#16)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: file-upload-no-mimetype-check
+    patterns:
+      - pattern: |
+          @UseInterceptors(FileInterceptor(...))
+          async $METHOD(@UploadedFile() $FILE: Express.Multer.File, ...) {
+            ...
+          }
+      - pattern-not: |
+          @UseInterceptors(FileInterceptor(..., { fileFilter: $FILTER, ... }))
+          async $METHOD(@UploadedFile() $FILE: Express.Multer.File, ...) {
+            ...
+          }
+    message: >
+      File upload without fileFilter: no MIME type or extension validation.
+      Add fileFilter to multer options to reject dangerous file types:
+      fileFilter: (req, file, cb) => {
+        const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+        cb(null, allowed.includes(file.mimetype));
+      }
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-434"]
+      owasp: ["A04:2021 - Insecure Design"]
+
+  - id: file-upload-no-size-limit
+    patterns:
+      - pattern: |
+          @UseInterceptors(FileInterceptor(...))
+          async $METHOD(@UploadedFile() $FILE, ...) { ... }
+      - pattern-not: |
+          @UseInterceptors(FileInterceptor(..., { limits: { fileSize: $SIZE }, ... }))
+          ...
+    message: >
+      File upload without size limit — DoS risk via large file upload.
+      Add limits: { fileSize: 5 * 1024 * 1024 } (5MB example) to multer options.
+    languages: [typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-400"]
+      owasp: ["A04:2021 - Insecure Design"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: Brute Force / Rate Limit — extended (#6, #18)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: auth-endpoint-no-throttle
+    patterns:
+      - pattern: |
+          @Post('login')
+          async $METHOD(...) { ... }
+      - pattern-not-inside: |
+          @Throttle(...)
+          ...
+      - pattern-not-inside: |
+          @UseGuards(ThrottlerGuard)
+          ...
+    message: >
+      Login endpoint without @Throttle decorator — brute force risk.
+      Add: @Throttle({ default: { limit: 5, ttl: 60000 } })
+      Also apply to: /register, /forgot-password, /verify-otp endpoints.
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-307"]
+      owasp: ["A07:2021 - Identification and Authentication Failures"]
+
+  - id: otp-endpoint-no-throttle
+    patterns:
+      - pattern: |
+          @Post($PATH)
+          async $METHOD(...) { ... }
+      - metavariable-regex:
+          metavariable: $PATH
+          regex: '''.*(otp|verify|confirm|2fa|mfa).*'''
+      - pattern-not-inside: |
+          @Throttle(...)
+          ...
+    message: >
+      OTP/verification endpoint without rate limiting — enumeration attack risk.
+      A 6-digit OTP has only 1M combinations: add @Throttle + lockout after N attempts.
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-307"]
+      owasp: ["A07:2021 - Identification and Authentication Failures"]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION: Race Condition (#19)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - id: race-condition-balance-update
+    patterns:
+      - pattern: |
+          const $BALANCE = await $REPO.findOne(...)
+          ...
+          await $REPO.save({ ..., balance: $BALANCE.$FIELD - $AMOUNT, ... })
+      - pattern: |
+          const $BALANCE = await $REPO.findOne(...)
+          ...
+          await $REPO.update($ID, { balance: $BALANCE.$FIELD - $AMOUNT })
+    message: >
+      Race condition risk: read-then-write balance update without atomic lock.
+      Concurrent requests can double-spend. Use atomic update:
+        await repo.decrement({ id }, 'balance', amount)
+      Or wrap in a transaction with pessimistic lock:
+        await queryRunner.manager.findOne(Entity, { lock: { mode: 'pessimistic_write' } })
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-362"]
+      owasp: ["A04:2021 - Insecure Design"]
+
+  - id: race-condition-inventory-update
+    patterns:
+      - pattern: |
+          const $ITEM = await $REPO.findOne(...)
+          ...
+          await $REPO.save({ ..., quantity: $ITEM.$FIELD - $QTY, ... })
+    message: >
+      Race condition risk: inventory decrement without atomic operation.
+      Concurrent orders can oversell. Use:
+        await repo.decrement({ id }, 'quantity', qty)
+      With a constraint: WHERE quantity >= qty to prevent negative stock.
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-362"]
+      owasp: ["A04:2021 - Insecure Design"]
+
+  - id: race-condition-redis-non-atomic
+    patterns:
+      - pattern: |
+          const $VAL = await $CLIENT.get($KEY)
+          ...
+          await $CLIENT.set($KEY, ...)
+      - pattern: |
+          const $VAL = await $REDIS.get($KEY)
+          ...
+          await $REDIS.set($KEY, ...)
+    message: >
+      Race condition risk: Redis GET then SET is not atomic.
+      Use INCR/DECR for counters, or SET NX for locks, or Lua scripts for
+      compound operations. Example for rate limiter: use INCR + EXPIRE atomically.
+    languages: [typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-362"]
+      owasp: ["A04:2021 - Insecure Design"]

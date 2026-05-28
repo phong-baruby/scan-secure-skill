@@ -1,0 +1,115 @@
+# =============================================================================
+# gitleaks.toml — Custom Gitleaks configuration
+# Extends default ruleset with company-specific secret patterns.
+# =============================================================================
+
+title = "Giakho Security - Gitleaks Config"
+
+[extend]
+  # Extend official gitleaks ruleset
+  useDefault = true
+
+# ── Allowlist (global) ────────────────────────────────────────────────────────
+[allowlist]
+  description = "Global allowlist"
+  paths = [
+    '''^node_modules/''',
+    '''^dist/''',
+    '''^build/''',
+    '''^coverage/''',
+    '''^\.nyc_output/''',
+    '''.*\.min\.js$''',
+    '''.*\.test\.ts$''',
+    '''.*\.spec\.ts$''',
+    '''.*CHANGELOG.*''',
+    '''.*\.md$''',  # Documentation — use noqe comments in real secrets
+  ]
+  regexes = [
+    # Placeholder values in docs/examples
+    '''(example|sample|demo|test|fake|dummy|placeholder)[-_]?(api[-_]?)?key''',
+    '''your[-_]?(api[-_]?)?key[-_]?here''',
+    '''<(API_KEY|SECRET|TOKEN|PASSWORD)>''',
+    # Common non-secret patterns that trigger false positives
+    '''localhost|127\.0\.0\.1''',
+  ]
+
+# ── Custom Rules ──────────────────────────────────────────────────────────────
+
+[[rules]]
+  id = "kiotviet-client-secret"
+  description = "KiotViet Client Secret"
+  regex = '''(?i)(kiotviet[_-]?client[_-]?secret|kv[_-]?secret)\s*[:=]\s*["']?([a-zA-Z0-9_\-]{20,})["']?'''
+  secretGroup = 2
+  entropy = 3.5
+  keywords = ["kiotviet", "kv_secret", "kv-secret"]
+  [rules.allowlist]
+    regexes = ['''(example|test|sample)''']
+
+[[rules]]
+  id = "kiotviet-app-id"
+  description = "KiotViet App ID"
+  regex = '''(?i)(kiotviet[_-]?app[_-]?id|kv[_-]?app[_-]?id)\s*[:=]\s*["']?(\d{5,})["']?'''
+  secretGroup = 2
+  keywords = ["kiotviet", "kv_app_id"]
+
+[[rules]]
+  id = "firebase-server-key"
+  description = "Firebase Server Key / Service Account"
+  regex = '''(?i)(firebase[_-]?server[_-]?key|fcm[_-]?server[_-]?key)\s*[:=]\s*["']?(AAAA[a-zA-Z0-9_\-]{100,})["']?'''
+  secretGroup = 2
+  keywords = ["firebase", "fcm"]
+
+[[rules]]
+  id = "goong-api-key"
+  description = "Goong.io Maps API Key"
+  regex = '''(?i)(goong[_-]?api[_-]?key|goong[_-]?token)\s*[:=]\s*["']?([a-zA-Z0-9]{30,})["']?'''
+  secretGroup = 2
+  keywords = ["goong", "goong_api_key"]
+
+[[rules]]
+  id = "cloudflare-r2-key"
+  description = "Cloudflare R2 / Workers credentials"
+  regex = '''(?i)(r2[_-]?secret|cloudflare[_-]?secret|cf[_-]?token)\s*[:=]\s*["']?([a-zA-Z0-9_\-]{30,})["']?'''
+  secretGroup = 2
+  keywords = ["cloudflare", "r2_secret", "cf_token"]
+  entropy = 4.0
+
+[[rules]]
+  id = "postgres-connection-string"
+  description = "PostgreSQL connection string with credentials"
+  regex = '''postgres(?:ql)?://[^:]+:([^@]+)@'''
+  secretGroup = 1
+  keywords = ["postgresql://", "postgres://"]
+  [rules.allowlist]
+    regexes = [
+      '''postgres://.*localhost''',
+      '''postgres://postgres:postgres@''',
+      '''postgres://test:test@''',
+    ]
+
+[[rules]]
+  id = "redis-url-with-auth"
+  description = "Redis URL with password"
+  regex = '''redis(?:s)?://:[^@]+@'''
+  keywords = ["redis://", "rediss://"]
+  [rules.allowlist]
+    regexes = ['''redis://.*localhost''']
+
+[[rules]]
+  id = "jwt-secret-env"
+  description = "JWT secret with high entropy value"
+  regex = '''(?i)(jwt[_-]?secret|jwt[_-]?key)\s*[:=]\s*["']?([a-zA-Z0-9+/=_\-]{32,})["']?'''
+  secretGroup = 2
+  entropy = 4.5
+  keywords = ["jwt_secret", "jwt_key"]
+  [rules.allowlist]
+    regexes = [
+      '''(your[-_]jwt|example[-_]jwt|changeme|replace[-_]me)''',
+    ]
+
+[[rules]]
+  id = "shopee-partner-key"
+  description = "Shopee Open Platform Partner Key"
+  regex = '''(?i)(shopee[_-]?partner[_-]?key|shopee[_-]?secret)\s*[:=]\s*["']?([a-zA-Z0-9]{40,})["']?'''
+  secretGroup = 2
+  keywords = ["shopee_partner", "shopee_secret"]
